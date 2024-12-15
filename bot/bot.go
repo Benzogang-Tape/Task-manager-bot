@@ -4,15 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	tgbotapi "github.com/skinass/telegram-bot-api/v5"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	tgbotapi "github.com/skinass/telegram-bot-api/v5"
+	"github.com/spf13/viper"
 )
 
 type BotMessages map[int64]string
@@ -54,11 +55,19 @@ const (
 	botMsgYouAreNotAssignee = "Задача не на вас"
 )
 
-var (
-	// @BotFather в телеграме даст вам это
-	BotToken = "TG_BOT_TOKEN"
+const (
+	defaultPort    = "8081"
+	portKey        = favContextKey("PORT")
+	botTokenKey    = favContextKey("BOT_TOKEN")
+	senderKey      = favContextKey("sender")
+	idGeneratorKey = favContextKey("generateID")
+	newTaskKey     = favContextKey("newTask")
+	taskIDKey      = favContextKey("taskID")
+	commandKey     = favContextKey("command")
+)
 
-	// урл выдаст вам игрок или хероку
+var (
+	BotToken   = ""
 	WebhookURL = "http://127.0.0.1:8081"
 
 	cmdTemplates = CommandTemplates{
@@ -93,24 +102,27 @@ func idGenerator() func() int64 {
 }
 
 func startBotCmd(ctx context.Context, _ *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("startBotCmd: fail converting sender to a User type")
 	}
+
 	return BotMessages{
 		sender.ChatID: availableActions,
 	}, nil
 }
 func listTasksBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("listTasksBotCmd: fail converting sender to a User type")
 	}
+
 	if len(storage.tasks) == 0 {
 		return BotMessages{
 			sender.ChatID: botMsgNoTasks,
 		}, nil
 	}
+
 	botResponse := make([]string, len(storage.tasks))
 	for taskIdx, task := range storage.tasks {
 		botResponse[taskIdx] = fmt.Sprintf("%d. %s by @%s", task.TaskID, task.TaskValue, task.TaskAuthor.UserName)
@@ -118,31 +130,37 @@ func listTasksBotCmd(ctx context.Context, storage *Storage) (BotMessages, error)
 			botResponse[taskIdx] += fmt.Sprintf("\n/assign_%d", task.TaskID)
 			continue
 		}
+
 		botResponse[taskIdx] += "\nassignee: "
 		if task.TaskAssignee.ChatID != sender.ChatID {
 			botResponse[taskIdx] += "@" + task.TaskAssignee.UserName
 			continue
 		}
+
 		botResponse[taskIdx] += fmt.Sprintf("я\n/unassign_%d /resolve_%d", task.TaskID, task.TaskID)
 	}
+
 	return BotMessages{
 		sender.ChatID: strings.Join(botResponse, "\n\n"),
 	}, nil
 }
 
 func newTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("newTaskBotCmd: fail converting sender to a User type")
 	}
-	generateID, ok := ctx.Value(favContextKey("generateID")).(func() int64)
+
+	generateID, ok := ctx.Value(idGeneratorKey).(func() int64)
 	if !ok {
 		return nil, errors.New("newTaskBotCmd: fail creating new task")
 	}
-	newTask, ok := ctx.Value(favContextKey("newTask")).(string)
+
+	newTask, ok := ctx.Value(newTaskKey).(string)
 	if !ok {
 		return nil, errors.New("newTaskBotCmd: fail converting newTask to a string type")
 	}
+
 	taskID := generateID()
 	storage.tasks = append(storage.tasks, Task{
 		TaskID:       taskID,
@@ -150,20 +168,23 @@ func newTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
 		TaskAuthor:   storage.botUsers[sender.ChatID],
 		TaskAssignee: nil,
 	})
+
 	return BotMessages{
 		sender.ChatID: fmt.Sprintf("Задача \"%s\" создана, id=%d", newTask, taskID),
 	}, nil
 }
 
 func assignTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("assignTaskBotCmd: fail converting sender to a User type")
 	}
-	taskID, ok := ctx.Value(favContextKey("taskID")).(int64)
+
+	taskID, ok := ctx.Value(taskIDKey).(int64)
 	if !ok {
 		return nil, errors.New("assignTaskBotCmd: fail converting taskID to a int64 type")
 	}
+
 	taskIdx := slices.IndexFunc(storage.tasks, func(task Task) bool {
 		return task.TaskID == taskID
 	})
@@ -178,24 +199,28 @@ func assignTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, error
 		botResponse[storage.tasks[taskIdx].TaskAssignee.ChatID] = fmt.Sprintf("Задача \"%s\" назначена на @%s",
 			storage.tasks[taskIdx].TaskValue, storage.botUsers[sender.ChatID].UserName)
 	}
+
 	if storage.tasks[taskIdx].TaskAssignee == nil && sender.ChatID != storage.tasks[taskIdx].TaskAuthor.ChatID {
 		botResponse[storage.tasks[taskIdx].TaskAuthor.ChatID] = fmt.Sprintf("Задача \"%s\" назначена на @%s",
 			storage.tasks[taskIdx].TaskValue, storage.botUsers[sender.ChatID].UserName)
 	}
+
 	botResponse[sender.ChatID] = fmt.Sprintf("Задача \"%s\" назначена на вас", storage.tasks[taskIdx].TaskValue)
 	storage.tasks[taskIdx].TaskAssignee = storage.botUsers[sender.ChatID]
 	return botResponse, nil
 }
 
 func unassignTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("unassignTaskBotCmd: fail converting sender to a User type")
 	}
-	taskID, ok := ctx.Value(favContextKey("taskID")).(int64)
+
+	taskID, ok := ctx.Value(taskIDKey).(int64)
 	if !ok {
 		return nil, errors.New("unassignTaskBotCmd: fail converting taskID to a int64 type")
 	}
+
 	taskIdx := slices.IndexFunc(storage.tasks, func(task Task) bool {
 		return task.TaskID == taskID
 	})
@@ -210,6 +235,7 @@ func unassignTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, err
 			sender.ChatID: botMsgYouAreNotAssignee,
 		}, nil
 	}
+
 	storage.tasks[taskIdx].TaskAssignee = nil
 	return BotMessages{
 		sender.ChatID:                            "Принято",
@@ -218,14 +244,16 @@ func unassignTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, err
 }
 
 func resolveTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("resolveTaskBotCmd: fail converting sender to a User type")
 	}
-	taskID, ok := ctx.Value(favContextKey("taskID")).(int64)
+
+	taskID, ok := ctx.Value(taskIDKey).(int64)
 	if !ok {
 		return nil, errors.New("resolveTaskBotCmd: fail converting taskID to a int64 type")
 	}
+
 	taskIdx := slices.IndexFunc(storage.tasks, func(task Task) bool {
 		return task.TaskID == taskID
 	})
@@ -240,21 +268,24 @@ func resolveTaskBotCmd(ctx context.Context, storage *Storage) (BotMessages, erro
 			sender.ChatID: botMsgYouAreNotAssignee,
 		}, nil
 	}
+
 	botMsgs := make(BotMessages)
 	botMsgs[sender.ChatID] = fmt.Sprintf("Задача \"%s\" выполнена", storage.tasks[taskIdx].TaskValue)
 	if sender.ChatID != storage.tasks[taskIdx].TaskAuthor.ChatID {
 		botMsgs[storage.tasks[taskIdx].TaskAuthor.ChatID] = fmt.Sprintf("Задача \"%s\" выполнена @%s",
 			storage.tasks[taskIdx].TaskValue, storage.tasks[taskIdx].TaskAssignee.UserName)
 	}
+
 	storage.tasks = slices.Delete(storage.tasks, taskIdx, taskIdx+1)
 	return botMsgs, nil
 }
 
 func myTasksBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("myTasksBotCmd: fail converting sender to a User type")
 	}
+
 	myTasks := make([]string, 0)
 	for _, task := range storage.tasks {
 		if task.TaskAssignee != nil && task.TaskAssignee.ChatID == sender.ChatID {
@@ -262,20 +293,23 @@ func myTasksBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
 				task.TaskID, task.TaskValue, task.TaskAuthor.UserName, task.TaskID, task.TaskID))
 		}
 	}
+
 	botResponse := make(BotMessages)
 	if len(myTasks) == 0 {
 		botResponse[sender.ChatID] = botMsgNoTasks
 	} else {
 		botResponse[sender.ChatID] = strings.Join(myTasks, "\n\n")
 	}
+
 	return botResponse, nil
 }
 
 func tasksOwnerBotCmd(ctx context.Context, storage *Storage) (BotMessages, error) {
-	sender, ok := ctx.Value(favContextKey("sender")).(User)
+	sender, ok := ctx.Value(senderKey).(User)
 	if !ok {
 		return nil, errors.New("tasksOwnerBotCmd: fail converting sender to a User type")
 	}
+
 	ownerTasks := make([]string, 0)
 	for _, task := range storage.tasks {
 		if task.TaskAuthor.ChatID == sender.ChatID {
@@ -287,23 +321,25 @@ func tasksOwnerBotCmd(ctx context.Context, storage *Storage) (BotMessages, error
 			ownerTasks[len(ownerTasks)-1] += fmt.Sprintf("\n/unassign_%d /resolve_%d", task.TaskID, task.TaskID)
 		}
 	}
+
 	botResponse := make(BotMessages)
 	if len(ownerTasks) == 0 {
 		botResponse[sender.ChatID] = botMsgNoTasks
 	} else {
 		botResponse[sender.ChatID] = strings.Join(ownerTasks, "\n\n")
 	}
+
 	return botResponse, nil
 }
 
 func handleMessage(ctx context.Context, message *tgbotapi.Message, storage *Storage) (BotMessages, error) {
-	log.Printf("[%v] %v", message.From.UserName, message.Text)
 	if _, userExists := storage.botUsers[message.Chat.ID]; !userExists {
 		storage.botUsers[message.Chat.ID] = &User{
 			ChatID:   message.Chat.ID,
 			UserName: message.From.UserName,
 		}
 	}
+
 	var cmdMatch bool
 	for _, cmdTmpl := range cmdTemplates {
 		if cmdTmpl.MatchString(message.Text) {
@@ -311,8 +347,9 @@ func handleMessage(ctx context.Context, message *tgbotapi.Message, storage *Stor
 			break
 		}
 	}
+
 	if !cmdMatch {
-		sender, ok := ctx.Value(favContextKey("sender")).(User)
+		sender, ok := ctx.Value(senderKey).(User)
 		if !ok {
 			return nil, errors.New("handleMessage: fail converting sender to a User type")
 		}
@@ -327,15 +364,15 @@ func handleMessage(ctx context.Context, message *tgbotapi.Message, storage *Stor
 		if err != nil {
 			return nil, err
 		}
-		ctx = context.WithValue(ctx, favContextKey("taskID"), int64(taskID))
+		ctx = context.WithValue(ctx, taskIDKey, int64(taskID))
 	} else {
 		cmd, suffix, found = strings.Cut(message.Text, " ")
 		if found {
-			ctx = context.WithValue(ctx, favContextKey("newTask"), suffix)
+			ctx = context.WithValue(ctx, newTaskKey, suffix)
 		}
 	}
-	ctx = context.WithValue(ctx, favContextKey("command"), cmd)
 
+	ctx = context.WithValue(ctx, commandKey, cmd)
 	result, err := handleCommand(ctx, storage)
 	if err != nil {
 		return nil, err
@@ -344,13 +381,15 @@ func handleMessage(ctx context.Context, message *tgbotapi.Message, storage *Stor
 }
 
 func handleCommand(ctx context.Context, storage *Storage) (BotMessages, error) {
-	botCmd, ok := ctx.Value(favContextKey("command")).(string)
+	botCmd, ok := ctx.Value(commandKey).(string)
 	if !ok {
 		return nil, errors.New("handleCommand: fail converting command to a string type")
 	}
+
 	if _, cmdFound := availableCommands[botCmd]; !cmdFound {
 		return nil, errors.New("handleCommand: no corresponding command was found")
 	}
+
 	result, err := availableCommands[botCmd](ctx, storage)
 	if err != nil {
 		return nil, err
@@ -359,18 +398,19 @@ func handleCommand(ctx context.Context, storage *Storage) (BotMessages, error) {
 }
 
 func startTaskBot(ctx context.Context) error {
-	bot, err := tgbotapi.NewBotAPI(BotToken)
+	token := ctx.Value(botTokenKey).(string)
+	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		return fmt.Errorf("NewBotAPI failed: %s", err)
+		return fmt.Errorf("startTaskBot: NewBotAPI failed: %s", err)
 	}
+
 	bot.Debug = true
 	log.Printf("Authorized on account %s\n", bot.Self.UserName)
 
-	/* // WITHOUT WEBHOOK (FOR DEMONSTRATION IN TELEGRAM)
-	u := tgbotapi.NewUpdate(0)
+	// WITHOUT WEBHOOK (FOR DEMONSTRATION IN TELEGRAM)
+	/*u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
-	*/
+	updates := bot.GetUpdatesChan(u)*/
 
 	// WITH WEBHOOK (FOR TESTS)
 	wh, err := tgbotapi.NewWebhook(WebhookURL)
@@ -385,10 +425,7 @@ func startTaskBot(ctx context.Context) error {
 
 	updates := bot.ListenForWebhook("/")
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8081"
-	}
+	port := ctx.Value(portKey).(string)
 	go func() {
 		log.Fatalln("http err:", http.ListenAndServe(":"+port, nil))
 	}()
@@ -399,12 +436,13 @@ func startTaskBot(ctx context.Context) error {
 		tasks:    make(Tasks, 0),
 	}
 	generateID := idGenerator()
-	ctx = context.WithValue(ctx, favContextKey("generateID"), generateID)
+	ctx = context.WithValue(ctx, idGeneratorKey, generateID)
 	for update := range updates {
 		if update.Message == nil {
 			continue
 		}
-		ctx = context.WithValue(ctx, favContextKey("sender"), User{
+
+		ctx = context.WithValue(ctx, senderKey, User{
 			ChatID:   update.Message.Chat.ID,
 			UserName: update.Message.Chat.UserName,
 		})
@@ -412,6 +450,7 @@ func startTaskBot(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
 		if err := sendResponse(bot, response); err != nil {
 			return err
 		}
@@ -431,8 +470,27 @@ func sendResponse(bot *tgbotapi.BotAPI, msgs BotMessages) error {
 }
 
 func main() {
-	err := startTaskBot(context.Background())
+	initConfig()
+	token := viper.GetString("bot.token")
+	if token == "" {
+		panic(errors.New("bot token is not set"))
+	}
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, botTokenKey, token)
+	ctx = context.WithValue(ctx, portKey, defaultPort)
+	if viper.IsSet("app.port") {
+		ctx = context.WithValue(ctx, portKey, viper.GetString("app.port"))
+	}
+	err := startTaskBot(ctx)
 	if err != nil {
 		panic(err)
+	}
+}
+
+func initConfig() {
+	viper.SetConfigName("config")
+	viper.AddConfigPath(".")
+	if err := viper.ReadInConfig(); err != nil {
+		panic(fmt.Errorf("fatal error config file: %w", err))
 	}
 }

@@ -4,21 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
-
-	"fmt"
-
-	tgbotapi "github.com/skinass/telegram-bot-api/v5"
-
-	// "io/ioutil"
-	"net/http"
-	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	// "io/ioutil"
+
+	tgbotapi "github.com/skinass/telegram-bot-api/v5"
 )
 
 func init() {
